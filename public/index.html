@@ -1,0 +1,314 @@
+﻿<!DOCTYPE html>
+<html lang="es">
+<head>
+ <meta charset="UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1.0">
+ <title>Jnox.inc - Monitoreo Automático</title>
+ <script src="https://cdn.tailwindcss.com"></script>
+ <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+ <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+ <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+ <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+ <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+ <style>
+ #map { height: 450px; border-radius: 16px; }
+ </style>
+</head>
+<body class="bg-slate-950 text-slate-100 flex flex-col min-h-screen">
+ <div id="root" class="flex-grow"></div>
+
+ <script type="text/babel">
+ function format12Hour(dateString) {
+ if (!dateString) return '';
+ const date = new Date(dateString);
+ return date.toLocaleString('en-US', {
+ month: 'numeric',
+ day: 'numeric',
+ year: 'numeric',
+ hour: 'numeric',
+ minute: '2-digit',
+ hour12: true
+ });
+ }
+
+ function getDistanceInMiles(lat1, lon1, lat2, lon2) {
+ const R = 3958.8;
+ const dLat = (lat2 - lat1) * Math.PI / 180;
+ const dLon = (lon2 - lon1) * Math.PI / 180;
+ const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+ Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+ Math.sin(dLon/2) * Math.sin(dLon/2);
+ const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+ return R * c;
+ }
+
+ function isRecentThanOneHour(dateString) {
+ if (!dateString) return false;
+ const postDate = new Date(dateString).getTime();
+ const now = new Date().getTime();
+ const ONE_HOUR_IN_MS = 60 * 60 * 1000;
+ return (now - postDate) <= ONE_HOUR_IN_MS;
+ }
+
+ function PostCard({ p }) {
+ const [expanded, setExpanded] = React.useState(false);
+ const isLong = p.message && p.message.length > 200;
+ const displayMessage = (isLong && !expanded) ? p.message.substring(0, 200) + "..." : p.message;
+
+ const searchQuery = encodeURIComponent('ICE ' + (p.city_or_county || '') + ' Virginia noticias operativos');
+ const searchUrl = 'https://www.google.com/search?q=' + searchQuery;
+ const tiktokSearchUrl = 'https://www.tiktok.com/search?q=' + encodeURIComponent('ICE ' + (p.city_or_county || ''));
+
+ return (
+ <div className="bg-slate-900 p-5 rounded-2xl border border-slate-800 space-y-3 hover:border-slate-700 transition">
+ <div className="flex justify-between items-center text-xs">
+ <span className="bg-red-500/20 text-red-400 border border-red-500/30 px-2.5 py-1 rounded-lg font-bold"> {p.city_or_county}</span>
+ <span className="text-slate-400 font-semibold"> {format12Hour(p.created_time)}</span>
+ </div>
+ 
+ <p className="text-sm text-slate-200 leading-relaxed font-medium">
+ {displayMessage}
+ </p>
+
+ {isLong && (
+ <button 
+ onClick={() => setExpanded(!expanded)} 
+ className="text-xs font-bold text-red-400 hover:text-red-300 transition flex items-center space-x-1"
+ >
+ <span>{expanded ? '▲ Ver menos' : '▼ Ver más'}</span>
+ </button>
+ )}
+
+ {p.image_url && (
+ <div className="mt-2 rounded-xl overflow-hidden border border-slate-800 max-h-64 bg-black flex justify-center items-center">
+ {p.image_url.includes('.mp4') ? (
+ <video controls src={p.image_url} className="max-h-64 w-full object-contain" />
+ ) : (
+ <img src={p.image_url} alt="Adjunto" className="max-h-64 object-cover w-full" />
+ )}
+ </div>
+ )}
+
+ <div className="flex flex-wrap items-center gap-2 pt-2 text-xs border-t border-slate-800/80">
+ {p.permalink_url && p.permalink_url !== '#' && (
+ <a href={p.permalink_url} target="_blank" className="bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 font-semibold px-3 py-1.5 rounded-lg border border-blue-500/30 transition flex items-center space-x-1">
+ <span> Ver Publicación</span>
+ </a>
+ )}
+
+ <a href={tiktokSearchUrl} target="_blank" className="bg-pink-600/20 hover:bg-pink-600/30 text-pink-400 font-semibold px-3 py-1.5 rounded-lg border border-pink-500/30 transition flex items-center space-x-1">
+ <span> TikToks en {p.city_or_county}</span>
+ </a>
+
+ <a href={searchUrl} target="_blank" className="bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 font-semibold px-3 py-1.5 rounded-lg border border-amber-500/30 transition flex items-center space-x-1">
+ <span> Buscar Noticias</span>
+ </a>
+ </div>
+ </div>
+ );
+ }
+
+ function App() {
+ const [posts, setPosts] = React.useState([]);
+ const [filter, setFilter] = React.useState('Todos');
+ const [userLocation, setUserLocation] = React.useState(null);
+ const [nearbyAlerts, setNearbyAlerts] = React.useState([]);
+ const [notifEnabled, setNotifEnabled] = React.useState(false);
+ const mapRef = React.useRef(null);
+ const markersRef = React.useRef([]);
+
+ const requestNotif = () => {
+ if ('Notification' in window) {
+ Notification.requestPermission().then(permission => {
+ if (permission === 'granted') {
+ setNotifEnabled(true);
+ new Notification(' Jnox.inc Activado', {
+ body: 'Recibirás notificaciones automáticas cuando haya eventos cerca de ti.'
+ });
+ }
+ });
+ }
+ };
+
+ const loadPosts = async () => {
+ try {
+ const res = await fetch('/api/posts');
+ const data = await res.json();
+ if (Array.isArray(data)) {
+ const sorted = data.sort((a, b) => new Date(b.created_time) - new Date(a.created_time));
+ setPosts(sorted);
+ }
+ } catch (err) {
+ console.error(err);
+ }
+ };
+
+ React.useEffect(() => {
+ loadPosts();
+ // Recargar automáticamente cada 2 minutos
+ const interval = setInterval(loadPosts, 120000);
+
+ if ('Notification' in window && Notification.permission === 'granted') {
+ setNotifEnabled(true);
+ }
+ if (navigator.geolocation) {
+ navigator.geolocation.getCurrentPosition(
+ (pos) => {
+ setUserLocation({
+ lat: pos.coords.latitude,
+ lng: pos.coords.longitude
+ });
+ },
+ (err) => console.log('GPS no activado:', err.message)
+ );
+ }
+ return () => clearInterval(interval);
+ }, []);
+
+ React.useEffect(() => {
+ if (!userLocation || posts.length === 0) return;
+ const alerts = posts.filter(p => {
+ if (!p.lat || !p.lng) return false;
+ const dist = getDistanceInMiles(userLocation.lat, userLocation.lng, p.lat, p.lng);
+ return dist <= 5.0 && isRecentThanOneHour(p.created_time);
+ });
+ setNearbyAlerts(alerts);
+
+ if (alerts.length > 0 && notifEnabled) {
+ new Notification(' ¡ALERTA CERCANA DETECTADA!', {
+ body: 'Hay ' + alerts.length + ' evento(s) activos a menos de 5 millas.'
+ });
+ }
+ }, [userLocation, posts]);
+
+ React.useEffect(() => {
+ if (!mapRef.current) {
+ mapRef.current = L.map('map').setView([38.8601, -77.1458], 11);
+ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+ attribution: '&copy; OpenStreetMap'
+ }).addTo(mapRef.current);
+ }
+
+ markersRef.current.forEach(m => mapRef.current.removeLayer(m));
+ markersRef.current = [];
+
+ if (userLocation) {
+ const userMarker = L.circleMarker([userLocation.lat, userLocation.lng], {
+ color: '#3b82f6',
+ fillColor: '#60a5fa',
+ fillOpacity: 0.9,
+ radius: 10
+ }).addTo(mapRef.current).bindPopup('<b> Tu Ubicación Actual</b>');
+ markersRef.current.push(userMarker);
+ }
+
+ const filteredPosts = filter === 'Todos' ? posts : posts.filter(p => p.city_or_county === filter);
+ 
+ filteredPosts.forEach(p => {
+ if (p.lat && p.lng && isRecentThanOneHour(p.created_time)) {
+ const marker = L.circle([p.lat, p.lng], {
+ color: '#dc2626',
+ fillColor: '#ef4444',
+ fillOpacity: 0.6,
+ radius: 600
+ }).addTo(mapRef.current).bindPopup('<b>' + p.city_or_county + '</b><br/>' + (p.message ? p.message.substring(0, 100) : ''));
+ markersRef.current.push(marker);
+ }
+ });
+ }, [posts, filter, userLocation]);
+
+ const filteredPosts = filter === 'Todos' ? posts : posts.filter(p => p.city_or_county === filter);
+
+ return (
+ <div className="max-w-7xl mx-auto p-4 sm:p-6 space-y-6">
+ <header className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-slate-900 p-6 rounded-2xl border border-red-900/40 shadow-2xl gap-4">
+ <div>
+ <div className="flex items-center space-x-3">
+ <span className="text-3xl"> </span>
+ <h1 className="text-3xl font-black text-red-500 tracking-wider uppercase">Jnox.inc</h1>
+ </div>
+ <p className="text-xs text-slate-400 mt-1">Plataforma Automática de Monitoreo Comunitario e Información en Tiempo Real</p>
+ </div>
+ <div className="flex flex-wrap items-center gap-2">
+ {!notifEnabled ? (
+ <button onClick={requestNotif} className="bg-amber-600 hover:bg-amber-500 text-white font-bold px-4 py-2 rounded-xl text-xs transition flex items-center space-x-1">
+ <span> </span> <span>Activar Avisos de Proximidad</span>
+ </button>
+ ) : (
+ <span className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 font-semibold px-3 py-1.5 rounded-xl text-xs flex items-center space-x-1">
+ <span> </span> <span>Avisos Activos</span>
+ </span>
+ )}
+ <button onClick={loadPosts} className="bg-slate-800 hover:bg-slate-700 text-white font-bold px-3 py-2 rounded-xl text-xs transition">
+ Actualizar
+ </button>
+ </div>
+ </header>
+
+ <div className="bg-slate-900/80 border border-slate-800 p-4 rounded-xl text-xs text-slate-400 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+ <div className="flex items-center space-x-2">
+ <span className="font-bold text-slate-200"> Sistema 100% Automatizado:</span>
+ <span className="bg-slate-800 px-2 py-1 rounded text-slate-300 font-mono">Actualización 24/7</span>
+ <span className="bg-slate-800 px-2 py-1 rounded text-slate-300 font-mono">Geolocalización Libre</span>
+ </div>
+ <p className="text-[11px] text-slate-500 italic">
+ El mapa elimina automáticamente los eventos con más de 1 hora de antigüedad.
+ </p>
+ </div>
+
+ {userLocation && nearbyAlerts.length > 0 && (
+ <div className="bg-red-950/80 border-2 border-red-600 text-red-200 p-4 rounded-2xl flex items-center space-x-4 animate-pulse">
+ <span className="text-3xl"> </span>
+ <div>
+ <p className="font-black text-sm uppercase text-red-400">¡ALERTA CERCANA ACTIVA!</p>
+ <p className="text-xs text-red-200/90">Se registran <b>{nearbyAlerts.length} evento(s)</b> en los últimos 60 minutos a menos de 5 millas de tu posición.</p>
+ </div>
+ </div>
+ )}
+
+ <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+ <div className="lg:col-span-2 space-y-4">
+ <div className="flex justify-between items-center bg-slate-900 p-4 rounded-xl border border-slate-800">
+ <h2 className="text-base font-bold text-slate-200">Historial de Publicaciones ({filteredPosts.length})</h2>
+ <select value={filter} onChange={e => setFilter(e.target.value)} className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-slate-200">
+ <option value="Todos">Todas las zonas</option>
+ <option value="Culmore / Zona General">Culmore / Zona General</option>
+ <option value="Fauquier, VA">Fauquier, VA</option>
+ <option value="Catlett, VA">Catlett, VA</option>
+ <option value="Columbia Pike">Columbia Pike</option>
+ <option value="Arlington">Arlington</option>
+ <option value="Alexandria">Alexandria</option>
+ <option value="Woodbridge">Woodbridge</option>
+ </select>
+ </div>
+
+ <div className="space-y-3">
+ {filteredPosts.map(p => (
+ <PostCard key={p.id} p={p} />
+ ))}
+ </div>
+ </div>
+
+ <div className="space-y-4">
+ <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 space-y-3">
+ <h2 className="text-base font-bold text-slate-200">Mapa Zonal Activo (&lt; 1 Hora)</h2>
+ <div id="map" className="shadow-2xl border border-slate-800"></div>
+ <p className="text-[11px] text-slate-400 leading-tight">
+ * Las marcas en rojo representan reportes recopilados automáticamente hace menos de 60 minutos. El punto azul es tu ubicación GPS.
+ </p>
+ </div>
+ </div>
+ </div>
+
+ <footer className="mt-12 text-center py-6 border-t border-slate-800 text-xs text-slate-500">
+ Created by <span className="text-slate-300 font-semibold">Jnox.inc</span> | Plataforma de Monitoreo Pasivo
+ </footer>
+ </div>
+ );
+ }
+
+ const root = ReactDOM.createRoot(document.getElementById('root'));
+ root.render(<App />);
+ </script>
+</body>
+</html>
